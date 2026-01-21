@@ -4,8 +4,8 @@ defmodule Sieve.Engine do
   import Ecto.Query
   alias Sieve.JobSpec
 
-  @default_limit 50
-  @max_limit 200
+  @default_limit Application.compile_env(:sieve, :default_limit, 50)
+  @max_limit Application.compile_env(:sieve, :max_limit, 200)
 
   @spec list(module(), map(), term(), map()) :: {:ok, list()} | {:error, term()}
   def list(repo, spec, actor, params) do
@@ -35,7 +35,7 @@ defmodule Sieve.Engine do
     jobs = Map.get(spec, :on_create, [])
 
     with {:ok, attrs} <- spec.policy.for_create(spec.schema, actor, attrs, params, spec) do
-      changeset = spec.schema.changeset(struct(spec.schema), attrs)
+      changeset = apply_changeset(spec.schema, struct(spec.schema), attrs, actor)
 
       case repo.insert(changeset) do
         {:ok, record} ->
@@ -63,7 +63,7 @@ defmodule Sieve.Engine do
       # Capture before state if any jobs need it
       before_record = if needs_before, do: deep_copy(struct), else: nil
 
-      changeset = spec.schema.changeset(struct, attrs)
+      changeset = apply_changeset(spec.schema, struct, attrs, actor)
 
       case repo.update(changeset) do
         {:ok, after_record} ->
@@ -111,7 +111,11 @@ defmodule Sieve.Engine do
     Enum.each(jobs, fn job_spec ->
       if JobSpec.should_run?(job_spec, before_record, after_record) do
         args = JobSpec.build_args(job_spec, before_record, after_record)
-        enqueue_job(job_spec.worker, args, job_spec.opts)
+
+        # Skip if args is nil (indicates job should not be enqueued)
+        if args != nil do
+          enqueue_job(job_spec.worker, args, job_spec.opts)
+        end
       end
     end)
   end
@@ -165,11 +169,22 @@ defmodule Sieve.Engine do
     |> then(&struct(struct.__struct__, &1))
   end
 
+  # Changeset helper - tries changeset/3 with actor first, falls back to changeset/2
+
+  defp apply_changeset(schema, struct, attrs, actor) do
+    if function_exported?(schema, :changeset, 3) do
+      schema.changeset(struct, attrs, actor)
+    else
+      schema.changeset(struct, attrs)
+    end
+  end
+
   # Query helpers
 
   defp apply_common(q, params, spec) do
     q
     |> maybe_apply_pk_filter(params, spec)
+    |> maybe_filter(params, spec)
     |> maybe_order(params)
     |> maybe_limit_offset(params)
   end
@@ -188,6 +203,114 @@ defmodule Sieve.Engine do
   end
 
   defp maybe_apply_pk_filter(q, _params, _spec), do: q
+
+  # Filter support: ?filter[field]=value or ?filter[field]=op:value
+  # Supported operators: like, gt, lt, gte, lte, ne, in, is_nil
+  # Examples:
+  #   ?filter[status]=active           -> WHERE status = 'active'
+  #   ?filter[name]=like:foo%          -> WHERE name LIKE 'foo%'
+  #   ?filter[age]=gt:18               -> WHERE age > 18
+  #   ?filter[role]=in:admin,user      -> WHERE role IN ('admin', 'user')
+  #   ?filter[deleted_at]=is_nil:true  -> WHERE deleted_at IS NULL
+  defp maybe_filter(q, %{"filter" => filters}, spec) when is_map(filters) do
+    schema = spec.schema
+    schema_fields = schema.__schema__(:fields) |> MapSet.new()
+
+    # Check for filterable whitelist in spec
+    filterable = Map.get(spec, :filterable)
+
+    Enum.reduce(filters, q, fn {field_name, value}, acc ->
+      field = safe_to_atom(field_name)
+
+      cond do
+        # Skip if field doesn't exist on schema
+        field == nil or not MapSet.member?(schema_fields, field) ->
+          acc
+
+        # Skip if filterable list exists and field is not in it
+        filterable != nil and field not in filterable ->
+          acc
+
+        true ->
+          apply_filter(acc, field, value)
+      end
+    end)
+  end
+
+  defp maybe_filter(q, _params, _spec), do: q
+
+  # Parse operator prefix and apply appropriate filter
+  defp apply_filter(q, field, "like:" <> pattern) do
+    where(q, [r], like(field(r, ^field), ^pattern))
+  end
+
+  defp apply_filter(q, field, "ilike:" <> pattern) do
+    where(q, [r], ilike(field(r, ^field), ^pattern))
+  end
+
+  defp apply_filter(q, field, "gt:" <> value) do
+    where(q, [r], field(r, ^field) > ^cast_filter_value(value))
+  end
+
+  defp apply_filter(q, field, "gte:" <> value) do
+    where(q, [r], field(r, ^field) >= ^cast_filter_value(value))
+  end
+
+  defp apply_filter(q, field, "lt:" <> value) do
+    where(q, [r], field(r, ^field) < ^cast_filter_value(value))
+  end
+
+  defp apply_filter(q, field, "lte:" <> value) do
+    where(q, [r], field(r, ^field) <= ^cast_filter_value(value))
+  end
+
+  defp apply_filter(q, field, "ne:" <> value) do
+    where(q, [r], field(r, ^field) != ^cast_filter_value(value))
+  end
+
+  defp apply_filter(q, field, "in:" <> values) do
+    list = values |> String.split(",") |> Enum.map(&String.trim/1)
+    where(q, [r], field(r, ^field) in ^list)
+  end
+
+  defp apply_filter(q, field, "is_nil:" <> flag) do
+    case flag do
+      f when f in ["true", "1", "yes"] ->
+        where(q, [r], is_nil(field(r, ^field)))
+
+      _ ->
+        where(q, [r], not is_nil(field(r, ^field)))
+    end
+  end
+
+  # Default: exact match
+  defp apply_filter(q, field, value) do
+    where(q, [r], field(r, ^field) == ^value)
+  end
+
+  # Cast filter values for numeric comparisons
+  defp cast_filter_value(value) do
+    cond do
+      # Integer
+      Regex.match?(~r/^-?\d+$/, value) ->
+        String.to_integer(value)
+
+      # Float/Decimal
+      Regex.match?(~r/^-?\d+\.\d+$/, value) ->
+        String.to_float(value)
+
+      # Keep as string
+      true ->
+        value
+    end
+  end
+
+  # Safely convert string to existing atom to prevent atom table exhaustion
+  defp safe_to_atom(str) when is_binary(str) do
+    String.to_existing_atom(str)
+  rescue
+    ArgumentError -> nil
+  end
 
   # Minimal order: order=field.asc,other.desc (no validation here; policies can enforce by scoping/selecting)
   defp maybe_order(q, %{"order" => order}) when is_binary(order) do
@@ -240,9 +363,16 @@ defmodule Sieve.Engine do
   defp cast_id(v) when is_integer(v), do: v
 
   defp cast_id(v) when is_binary(v) do
-    case Integer.parse(v) do
-      {i, _} -> i
-      :error -> -1
+    # Check if it looks like a UUID (contains hyphens or is 32+ hex chars)
+    if String.contains?(v, "-") or (String.length(v) >= 32 and String.match?(v, ~r/^[a-fA-F0-9]+$/)) do
+      # Keep as string for UUID/binary_id types
+      v
+    else
+      # Try to parse as integer for regular integer IDs
+      case Integer.parse(v) do
+        {i, ""} -> i
+        _ -> v
+      end
     end
   end
 

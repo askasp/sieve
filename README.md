@@ -7,7 +7,7 @@ A PostgREST-like library for Phoenix and Ecto that provides automatic REST API e
 - **Automatic REST API** - Define tables, get REST endpoints automatically
 - **Row-level security** - All queries scoped to the current user via ownership field
 - **Field projection** - Control which fields are readable and writable
-- **Query capabilities** - Sorting, pagination, field selection via URL params
+- **Query capabilities** - Filtering, sorting, pagination, field selection via URL params
 - **Multiple registry patterns** - Inline or module-based table definitions (great for codegen)
 
 ## Installation
@@ -223,6 +223,46 @@ GET /api/profiles?limit=10&offset=20
 ```
 Default limit is 50, maximum is 200.
 
+### `filter` - Field filtering
+```
+GET /api/profiles?filter[status]=active
+GET /api/profiles?filter[name]=ilike:john%
+GET /api/profiles?filter[age]=gt:18
+GET /api/profiles?filter[role]=in:admin,moderator
+```
+
+Filter records by field values. Supports operators:
+
+| Operator | Example | SQL Equivalent |
+|----------|---------|----------------|
+| (none) | `filter[status]=active` | `WHERE status = 'active'` |
+| `like:` | `filter[name]=like:John%` | `WHERE name LIKE 'John%'` |
+| `ilike:` | `filter[name]=ilike:john%` | `WHERE name ILIKE 'john%'` (case-insensitive) |
+| `gt:` | `filter[age]=gt:18` | `WHERE age > 18` |
+| `gte:` | `filter[age]=gte:18` | `WHERE age >= 18` |
+| `lt:` | `filter[age]=lt:65` | `WHERE age < 65` |
+| `lte:` | `filter[age]=lte:65` | `WHERE age <= 65` |
+| `ne:` | `filter[status]=ne:deleted` | `WHERE status != 'deleted'` |
+| `in:` | `filter[role]=in:a,b,c` | `WHERE role IN ('a', 'b', 'c')` |
+| `is_nil:` | `filter[deleted_at]=is_nil:true` | `WHERE deleted_at IS NULL` |
+| `is_nil:` | `filter[deleted_at]=is_nil:false` | `WHERE deleted_at IS NOT NULL` |
+
+Multiple filters are combined with AND:
+```
+GET /api/profiles?filter[status]=active&filter[role]=admin
+# WHERE status = 'active' AND role = 'admin'
+```
+
+**Security**: Only fields that exist on the schema can be filtered. Optionally, you can restrict filterable fields by adding a `filterable` list to your resource spec:
+
+```elixir
+resource "profiles", %{
+  schema: MyApp.Profile,
+  policy: MyPolicy,
+  filterable: [:status, :role, :name]  # Only these fields can be filtered
+}
+```
+
 ## Advanced Usage
 
 ### Custom actor resolution
@@ -284,7 +324,7 @@ See the `examples/` directory for:
 Potential future features:
 - [ ] POST support for creating rows
 - [ ] DELETE support
-- [ ] Filtering via URL params (e.g., `?title=like.*hello*`)
+- [x] Filtering via URL params (e.g., `?filter[title]=like:hello%`)
 - [ ] Relationship embedding/expansion
 - [ ] RPC-style function calls
 - [ ] Bulk operations

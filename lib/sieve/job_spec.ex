@@ -28,6 +28,17 @@ defmodule Sieve.JobSpec do
         when: fn before, record -> before.title != record.title end
       }
 
+      # Conditional via args (return nil to skip enqueueing)
+      %Sieve.JobSpec{
+        worker: MyApp.NotifyWorker,
+        args: fn before, record ->
+          if before.status != :published and record.status == :published do
+            %{post_id: record.id}
+          end
+          # Returns nil if condition not met -> job not enqueued
+        end
+      }
+
       # Conditional - only when published
       %Sieve.JobSpec{
         worker: MyApp.NotifyFollowersWorker,

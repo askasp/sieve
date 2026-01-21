@@ -34,10 +34,11 @@ defmodule Sieve.Plug do
   def call(conn, %{resources: resources, repo: repo, actor_assign: actor_assign} = _opts) do
     actor = conn.assigns[actor_assign]
     params = conn.query_params
+    headers = conn.req_headers
 
     case {conn.method, conn.path_info} do
       {"GET", [table]} ->
-        with {:ok, spec} <- fetch(resources, table),
+        with {:ok, spec} <- fetch(resources, table, headers),
              {:ok, rows} <- Sieve.Engine.list(repo, spec, actor, params) do
           json(conn, 200, rows)
         else
@@ -47,17 +48,18 @@ defmodule Sieve.Plug do
       {"POST", [table]} ->
         attrs = read_json_body_map!(conn)
 
-        with {:ok, spec} <- fetch(resources, table),
+        with {:ok, spec} <- fetch(resources, table, headers),
              {:ok, row} <- Sieve.Engine.create(repo, spec, actor, attrs, params) do
           json(conn, 201, row)
         else
-          {:error, :forbidden} -> send_resp(conn, 403, "")
+          {:error, :unauthorized} -> json(conn, 401, %{error: "Unauthorized"})
+          {:error, :forbidden} -> json(conn, 403, %{error: "Forbidden"})
           {:error, {:changeset, cs}} -> json(conn, 422, changeset_errors(cs))
           _ -> send_resp(conn, 400, "")
         end
 
       {"GET", [table, id]} ->
-        with {:ok, spec} <- fetch(resources, table),
+        with {:ok, spec} <- fetch(resources, table, headers),
              {:ok, row} <- Sieve.Engine.get(repo, spec, actor, id, params) do
           json(conn, 200, row)
         else
@@ -68,23 +70,25 @@ defmodule Sieve.Plug do
       {method, [table, id]} when method in ["PATCH", "PUT"] ->
         attrs = read_json_body_map!(conn)
 
-        with {:ok, spec} <- fetch(resources, table),
+        with {:ok, spec} <- fetch(resources, table, headers),
              {:ok, row} <- Sieve.Engine.update(repo, spec, actor, id, attrs, params) do
           json(conn, 200, row)
         else
           {:error, :not_found} -> send_resp(conn, 404, "")
-          {:error, :forbidden} -> send_resp(conn, 403, "")
+          {:error, :unauthorized} -> json(conn, 401, %{error: "Unauthorized"})
+          {:error, :forbidden} -> json(conn, 403, %{error: "Forbidden"})
           {:error, {:changeset, cs}} -> json(conn, 422, changeset_errors(cs))
           _ -> send_resp(conn, 400, "")
         end
 
       {"DELETE", [table, id]} ->
-        with {:ok, spec} <- fetch(resources, table),
+        with {:ok, spec} <- fetch(resources, table, headers),
              {:ok, _deleted} <- Sieve.Engine.delete(repo, spec, actor, id, params) do
           send_resp(conn, 204, "")
         else
           {:error, :not_found} -> send_resp(conn, 404, "")
-          {:error, :forbidden} -> send_resp(conn, 403, "")
+          {:error, :unauthorized} -> json(conn, 401, %{error: "Unauthorized"})
+          {:error, :forbidden} -> json(conn, 403, %{error: "Forbidden"})
           _ -> send_resp(conn, 400, "")
         end
 
@@ -93,9 +97,9 @@ defmodule Sieve.Plug do
     end
   end
 
-  defp fetch(resources, table) do
+  defp fetch(resources, table, headers) do
     case resources.fetch(table) do
-      {:ok, spec} -> {:ok, normalize_spec!(spec)}
+      {:ok, spec} -> {:ok, normalize_spec!(spec) |> Map.put(:headers, headers)}
       :error -> {:error, :not_found}
     end
   end
@@ -139,7 +143,7 @@ defmodule Sieve.Plug do
   defp jsonable(%Time{} = t),
     do: Time.to_iso8601(t)
 
-  # Decimal
+  # Decimal - keep as string to preserve precision
   defp jsonable(%Decimal{} = dec),
     do: Decimal.to_string(dec)
 

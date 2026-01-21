@@ -17,6 +17,27 @@ defmodule Sieve.Policy do
   By default, all operations are denied (deny-by-default). Override the callbacks
   you want to allow.
 
+  ## Request Headers
+
+  The `spec` map passed to all callbacks includes `:headers` - the request headers
+  from the connection. This is useful for webhook authentication:
+
+      def for_create(_schema, _actor, attrs, _params, spec) do
+        expected = Application.get_env(:my_app, :webhook_token)
+
+        case get_header(spec.headers, "authorization") do
+          "Bearer " <> ^expected -> {:ok, attrs}
+          _ -> {:error, :unauthorized}
+        end
+      end
+
+      defp get_header(headers, key) do
+        case List.keyfind(headers, key, 0) do
+          {_, value} -> value
+          nil -> nil
+        end
+      end
+
   ## Built-in Policies
 
   Sieve provides reusable policies for common patterns:
