@@ -43,7 +43,7 @@ defmodule Sieve.OpenApiSpex do
         acc
         |> put_schema(schema_name, schema_from_ecto(schema_mod, :response, response_required))
         |> put_schema(input_schema_name, schema_from_ecto(schema_mod, :input, input_required))
-        |> put_path("#{mount}/#{table}", path_item_for_collection(table, schema_name, input_schema_name, tag))
+        |> put_path("#{mount}/#{table}", path_item_for_collection(table, schema_name, input_schema_name, tag, spec))
         |> put_path("#{mount}/#{table}/{id}", path_item_for_member(table, pk, schema_name, input_schema_name, tag))
       end
     end)
@@ -79,8 +79,9 @@ defmodule Sieve.OpenApiSpex do
   defp put_schema(acc, name, %Schema{} = schema),
     do: update_in(acc, [:schemas], fn m -> Map.put_new(m, name, schema) end)
 
-  defp path_item_for_collection(table, schema_name, input_schema_name, tag) do
+  defp path_item_for_collection(table, schema_name, input_schema_name, tag, spec) do
     tags = if tag, do: [tag], else: []
+    filter_params = build_filter_params(spec)
 
     %PathItem{
       get: %Operation{
@@ -92,7 +93,7 @@ defmodule Sieve.OpenApiSpex do
           query_param(:order, :string, "order=field.asc,other.desc"),
           query_param(:limit, :integer, "limit"),
           query_param(:offset, :integer, "offset")
-        ],
+        ] ++ filter_params,
         responses: %{200 => ok_array_response(ref(schema_name)), 401 => unauthorized()}
       },
       post: %Operation{
@@ -153,6 +154,36 @@ defmodule Sieve.OpenApiSpex do
       schema: %Schema{type: type}
     }
   end
+
+  defp build_filter_params(spec) do
+    case Map.get(spec, :filterable) do
+      nil ->
+        []
+
+      fields when is_list(fields) ->
+        schema_mod = Map.fetch!(spec, :schema)
+
+        Enum.map(fields, fn field ->
+          type = schema_mod.__schema__(:type, field)
+          openapi_type = filter_param_type(type)
+
+          %Parameter{
+            name: "filter[#{field}]",
+            in: :query,
+            description: "Filter by #{field}. Supports operators: gt:, gte:, lt:, lte:, ne:, like:, ilike:, in:, is_nil:",
+            required: false,
+            schema: %Schema{type: openapi_type}
+          }
+        end)
+    end
+  end
+
+  defp filter_param_type(:integer), do: :string
+  defp filter_param_type(:float), do: :string
+  defp filter_param_type(:decimal), do: :string
+  defp filter_param_type(:boolean), do: :string
+  defp filter_param_type(:binary_id), do: :string
+  defp filter_param_type(_), do: :string
 
   defp path_param(name, type, desc) do
     %Parameter{

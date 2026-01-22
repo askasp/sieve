@@ -3,6 +3,7 @@ defmodule Sieve.Engine do
 
   import Ecto.Query
   alias Sieve.JobSpec
+  alias Sieve.Broadcast
 
   @default_limit Application.compile_env(:sieve, :default_limit, 50)
   @max_limit Application.compile_env(:sieve, :max_limit, 200)
@@ -33,6 +34,7 @@ defmodule Sieve.Engine do
   @spec create(module(), map(), term(), map(), map()) :: {:ok, map() | struct()} | {:error, term()}
   def create(repo, spec, actor, attrs, params) do
     jobs = Map.get(spec, :on_create, [])
+    pk = Map.get(spec, :pk, :id)
 
     with {:ok, attrs} <- spec.policy.for_create(spec.schema, actor, attrs, params, spec) do
       changeset = apply_changeset(spec.schema, struct(spec.schema), attrs, actor)
@@ -41,6 +43,7 @@ defmodule Sieve.Engine do
         {:ok, record} ->
           # For create: before is nil, after is the created record
           enqueue_jobs(jobs, nil, record)
+          maybe_broadcast(:created, spec, pk, nil, record)
           {:ok, record}
 
         {:error, cs} ->
@@ -54,13 +57,14 @@ defmodule Sieve.Engine do
   def update(repo, spec, actor, id, attrs, params) do
     id = cast_id(id)
     jobs = Map.get(spec, :on_update, [])
-    needs_before = JobSpec.needs_before_after?(jobs)
+    pk = Map.get(spec, :pk, :id)
+    needs_before = JobSpec.needs_before_after?(jobs) or Broadcast.broadcast_configured?(spec)
 
     with {:ok, %{query: q, attrs: attrs}} <-
            spec.policy.for_update(spec.schema, actor, id, attrs, params, spec),
          q = apply_pk_filter(q, id, spec),
          struct when not is_nil(struct) <- repo.one(q) do
-      # Capture before state if any jobs need it
+      # Capture before state if any jobs need it or broadcast is configured
       before_record = if needs_before, do: deep_copy(struct), else: nil
 
       changeset = apply_changeset(spec.schema, struct, attrs, actor)
@@ -68,6 +72,7 @@ defmodule Sieve.Engine do
       case repo.update(changeset) do
         {:ok, after_record} ->
           enqueue_jobs(jobs, before_record, after_record)
+          maybe_broadcast(:updated, spec, pk, before_record, after_record)
           {:ok, after_record}
 
         {:error, cs} ->
@@ -84,6 +89,7 @@ defmodule Sieve.Engine do
   def delete(repo, spec, actor, id, params) do
     id = cast_id(id)
     jobs = Map.get(spec, :on_delete, [])
+    pk = Map.get(spec, :pk, :id)
 
     with {:ok, q} <- spec.policy.for_delete(spec.schema, actor, id, params, spec),
          q = apply_pk_filter(q, id, spec),
@@ -92,6 +98,7 @@ defmodule Sieve.Engine do
         {:ok, deleted} ->
           # For delete: before is the deleted record, after is nil
           enqueue_jobs(jobs, deleted, nil)
+          maybe_broadcast(:deleted, spec, pk, deleted, nil)
           {:ok, deleted}
 
         {:error, cs} ->
@@ -100,6 +107,17 @@ defmodule Sieve.Engine do
     else
       nil -> {:error, :not_found}
       {:error, e} -> {:error, e}
+    end
+  end
+
+  # Broadcasting
+
+  defp maybe_broadcast(event, spec, pk, before_record, after_record) do
+    if Broadcast.broadcast_configured?(spec) do
+      # Get the PK value from the appropriate record
+      record = after_record || before_record
+      pk_value = Map.get(record, pk)
+      Broadcast.broadcast(event, spec.name, pk_value, before_record, after_record, spec.broadcast)
     end
   end
 
