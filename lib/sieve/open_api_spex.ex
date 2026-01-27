@@ -240,6 +240,16 @@ defmodule Sieve.OpenApiSpex do
     end
   end
 
+  # Build properties map for an embedded schema (handles nested embeds recursively)
+  defp build_embed_properties(embed_mod) do
+    fields = embed_mod.__schema__(:fields)
+
+    Enum.reduce(fields, %{}, fn field, acc ->
+      type = embed_mod.__schema__(:type, field)
+      Map.put(acc, Atom.to_string(field), openapi_schema(type))
+    end)
+  end
+
   # Handle Ecto.Enum - newer Ecto versions use nested tuple structure
   defp openapi_schema({:parameterized, {Ecto.Enum, %{mappings: mappings}}}) do
     values = mappings |> Keyword.keys() |> Enum.map(&Atom.to_string/1)
@@ -250,6 +260,17 @@ defmodule Sieve.OpenApiSpex do
   defp openapi_schema({:parameterized, Ecto.Enum, %{mappings: mappings}}) do
     values = mappings |> Keyword.keys() |> Enum.map(&Atom.to_string/1)
     %Schema{type: :string, enum: values}
+  end
+
+  # Handle Ecto.Embedded (embeds_one / embeds_many)
+  defp openapi_schema({:parameterized, {Ecto.Embedded, %Ecto.Embedded{cardinality: cardinality, related: related_mod}}}) do
+    embed_props = build_embed_properties(related_mod)
+    embed_object = %Schema{type: :object, properties: embed_props}
+
+    case cardinality do
+      :one -> %Schema{embed_object | nullable: true}
+      :many -> %Schema{type: :array, items: embed_object}
+    end
   end
 
   defp openapi_schema(type), do: %Schema{type: openapi_type(type)}
