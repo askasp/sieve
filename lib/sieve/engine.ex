@@ -287,8 +287,23 @@ defmodule Sieve.Engine do
   end
 
   defp apply_filter(q, field, "in:" <> values) do
-    list = values |> String.split(",") |> Enum.map(&String.trim/1)
+    list =
+      values
+      |> String.split(",")
+      |> Enum.map(&String.trim/1)
+      |> Enum.map(&cast_filter_value/1)
+
     where(q, [r], field(r, ^field) in ^list)
+  end
+
+  defp apply_filter(q, field, "not_in:" <> values) do
+    list =
+      values
+      |> String.split(",")
+      |> Enum.map(&String.trim/1)
+      |> Enum.map(&cast_filter_value/1)
+
+    where(q, [r], field(r, ^field) not in ^list)
   end
 
   defp apply_filter(q, field, "is_nil:" <> flag) do

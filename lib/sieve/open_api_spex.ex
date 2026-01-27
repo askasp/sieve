@@ -35,10 +35,11 @@ defmodule Sieve.OpenApiSpex do
 
         input_schema_name = "#{schema_name}Input"
 
-        # Get required fields from spec (for input validation)
-        input_required = Map.get(spec, :required, [])
-        # Get response required fields (additional to auto-fields)
-        response_required = Map.get(spec, :response_required, [])
+        # Get required fields: first check spec override, then schema's required_fields/0 function
+        schema_required = extract_required_fields(schema_mod)
+        input_required = Map.get(spec, :required) || schema_required
+        # Response required: use spec override, or fall back to schema's required_fields
+        response_required = Map.get(spec, :response_required) || schema_required
 
         acc
         |> put_schema(schema_name, schema_from_ecto(schema_mod, :response, response_required))
@@ -170,7 +171,7 @@ defmodule Sieve.OpenApiSpex do
           %Parameter{
             name: "filter[#{field}]",
             in: :query,
-            description: "Filter by #{field}. Supports operators: gt:, gte:, lt:, lte:, ne:, like:, ilike:, in:, is_nil:",
+            description: "Filter by #{field}. Supports operators: gt:, gte:, lt:, lte:, ne:, like:, ilike:, in:, not_in:, is_nil:",
             required: false,
             schema: %Schema{type: openapi_type}
           }
@@ -196,10 +197,6 @@ defmodule Sieve.OpenApiSpex do
   end
 
   @auto_fields ~w(id inserted_at updated_at)a
-
-  defp schema_from_ecto(schema_mod, mode) do
-    schema_from_ecto(schema_mod, mode, [])
-  end
 
   defp schema_from_ecto(schema_mod, mode, extra_required) do
     fields = schema_mod.__schema__(:fields)
@@ -328,5 +325,18 @@ defmodule Sieve.OpenApiSpex do
     Map.merge(a, b, fn _k, v1, v2 ->
       if is_map(v1) and is_map(v2), do: deep_merge(v1, v2), else: v2
     end)
+  end
+
+  # Extract required fields from schema module
+  # Checks for required_fields/0 function first, then falls back to empty list
+  defp extract_required_fields(schema_mod) do
+    # Ensure the module is loaded before checking for exported functions
+    Code.ensure_loaded(schema_mod)
+
+    if function_exported?(schema_mod, :required_fields, 0) do
+      schema_mod.required_fields()
+    else
+      []
+    end
   end
 end
