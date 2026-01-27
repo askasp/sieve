@@ -1,335 +1,197 @@
-# Sieve
+# sieve
 
-A PostgREST-like library for Phoenix and Ecto that provides automatic REST API endpoints with row-level security.
+A library for Phoenix that gives you supabase/firebase-style CRUD without leaving Elixir.
 
-## Features
+## What it does
 
-- **Automatic REST API** - Define tables, get REST endpoints automatically
-- **Row-level security** - All queries scoped to the current user via ownership field
-- **Field projection** - Control which fields are readable and writable
-- **Query capabilities** - Filtering, sorting, pagination, field selection via URL params
-- **Multiple registry patterns** - Inline or module-based table definitions (great for codegen)
+You define your Ecto schemas, add some policies (like Postgres RLS but in Elixir), and sieve exposes them all through a single REST endpoint. It handles filtering, sorting, pagination, authorization, and generates an OpenAPI spec automatically.
 
-## Installation
+Instead of writing controller actions for every table, you declare what's exposed and how it's protected. Sieve does the rest.
 
-Add `sieve` to your `mix.exs`:
+## Quick example
+
+### 1. Define your resources
 
 ```elixir
-def deps do
-  [
-    {:sieve, "~> 0.1.0"}
-  ]
+defmodule MyApp.Resources do
+  use Sieve.Resources, repo: MyApp.Repo
+
+  resource "posts", %{
+    schema: MyApp.Blog.Post,
+    policy: MyApp.Policies.OwnedByUser,
+    on_create: [
+      %Sieve.JobSpec{worker: MyApp.Workers.NotifyFollowers}
+    ]
+  }
+
+  resource "comments", %{
+    schema: MyApp.Blog.Comment,
+    policy: MyApp.Policies.OwnedByUser
+  }
+
+  resource "categories", %{
+    schema: MyApp.Blog.Category,
+    policy: MyApp.Policies.PublicRead
+  }
 end
 ```
 
-## Quick Start
+### 2. Write a policy
 
-### 1. Define your table registry
-
-You have two options for defining tables:
-
-#### Option A: Inline registry (simple, all in one file)
+Policies control who can do what. They're just modules that return scoped queries.
 
 ```elixir
-defmodule MyApp.TableRegistry do
-  use Sieve.Registry
+defmodule MyApp.Policies.OwnedByUser do
+  use Sieve.Policy
 
-  tables do
-    table "profiles", %{
-      schema: MyApp.Accounts.Profile,
-      pk: :id,
-      owner_key: :user_id,
-      readable: [:id, :display_name, :bio, :inserted_at, :updated_at],
-      writable: [:display_name, :bio]
-    }
+  # Users can only list their own records
+  def for_list(queryable, actor, _params, _spec) do
+    from(r in queryable, where: r.user_id == ^actor.id)
+  end
 
-    table "todos", %{
-      schema: MyApp.Tasks.Todo,
-      pk: :id,
-      owner_key: :user_id,
-      readable: [:id, :title, :done, :inserted_at, :updated_at],
-      writable: [:title, :done]
-    }
+  # Users can only get their own records
+  def for_get(queryable, actor, id, _params, _spec) do
+    from(r in queryable, where: r.user_id == ^actor.id and r.id == ^id)
+  end
+
+  # Auto-set user_id on create
+  def for_create(_schema, actor, attrs, _params, _spec) do
+    {:ok, Map.put(attrs, "user_id", actor.id)}
+  end
+
+  # Users can only update their own records
+  def for_update(queryable, actor, id, attrs, _params, _spec) do
+    query = from(r in queryable, where: r.user_id == ^actor.id and r.id == ^id)
+    {:ok, %{query: query, attrs: attrs}}
+  end
+
+  # Users can only delete their own records
+  def for_delete(queryable, actor, id, _params, _spec) do
+    query = from(r in queryable, where: r.user_id == ^actor.id and r.id == ^id)
+    {:ok, query}
   end
 end
 ```
 
-#### Option B: Module-based registry (recommended for codegen)
-
-This approach lets you define each table in its own file, making it easier to:
-- Generate table definitions programmatically
-- Edit tables in a visual editor
-- Keep code organized with many tables
-
 ```elixir
-# lib/my_app/tables/profiles.ex
-defmodule MyApp.Tables.Profiles do
-  @behaviour Sieve.TableSpec
+defmodule MyApp.Policies.PublicRead do
+  use Sieve.Policy
 
-  def spec do
-    %{
-      schema: MyApp.Accounts.Profile,
-      pk: :id,
-      owner_key: :user_id,
-      readable: [:id, :display_name, :bio, :inserted_at, :updated_at],
-      writable: [:display_name, :bio]
-    }
+  # Anyone can list
+  def for_list(queryable, _actor, _params, _spec), do: queryable
+
+  # Anyone can get by id
+  def for_get(queryable, _actor, id, _params, _spec) do
+    from(r in queryable, where: r.id == ^id)
   end
 
-  def name, do: "profiles"
-end
-
-# lib/my_app/tables/todos.ex
-defmodule MyApp.Tables.Todos do
-  @behaviour Sieve.TableSpec
-
-  def spec do
-    %{
-      schema: MyApp.Tasks.Todo,
-      pk: :id,
-      owner_key: :user_id,
-      readable: [:id, :title, :done, :inserted_at, :updated_at],
-      writable: [:title, :done]
-    }
-  end
-
-  def name, do: "todos"
-end
-
-# lib/my_app/table_registry.ex
-defmodule MyApp.TableRegistry do
-  use Sieve.Registry
-
-  register_modules([
-    MyApp.Tables.Profiles,
-    MyApp.Tables.Todos
-  ])
+  # Writes denied by default (inherited from Sieve.Policy)
 end
 ```
 
-### 2. Create a controller
+### 3. Mount the plug
 
 ```elixir
-defmodule MyAppWeb.TableController do
-  use MyAppWeb, :controller
+# router.ex
+scope "/api" do
+  pipe_through [:api, :require_auth]
 
-  use Sieve.Controller,
-    registry: MyApp.TableRegistry,
+  forward "/", Sieve.Plug,
+    resources: MyApp.Resources,
     repo: MyApp.Repo,
-    actor_key: :current_user
-
-  action_fallback MyAppWeb.FallbackController
+    actor_assign: :current_user
 end
 ```
 
-### 3. Add routes
+That's it. You now have:
+
+```
+GET    /api/posts           # list (filtered by policy)
+POST   /api/posts           # create
+GET    /api/posts/:id       # get
+PATCH  /api/posts/:id       # update
+DELETE /api/posts/:id       # delete
+```
+
+Same for comments, categories, and anything else you add.
+
+## Query parameters
+
+```bash
+# Filter
+GET /api/posts?filter[status]=published
+GET /api/posts?filter[title]=ilike:hello%
+GET /api/posts?filter[views]=gt:100
+
+# Sort
+GET /api/posts?order=inserted_at.desc
+
+# Paginate
+GET /api/posts?limit=20&offset=40
+
+# Select fields
+GET /api/posts?select=id,title,status
+```
+
+Filter operators: `like:`, `ilike:`, `gt:`, `gte:`, `lt:`, `lte:`, `ne:`, `in:`, `is_nil:`
+
+## Async workers
+
+Trigger background jobs on CRUD events using Oban:
 
 ```elixir
-# lib/my_app_web/router.ex
-scope "/api", MyAppWeb do
-  pipe_through [:api, :auth]  # :auth pipeline must assign current_user
-
-  get  "/:table",     TableController, :index
-  get  "/:table/:id", TableController, :show
-  patch "/:table/:id", TableController, :update
-end
-```
-
-### 4. Ensure your schemas have changesets
-
-```elixir
-defmodule MyApp.Accounts.Profile do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  schema "profiles" do
-    field :display_name, :string
-    field :bio, :string
-    field :user_id, :id
-
-    timestamps()
-  end
-
-  def changeset(profile, attrs) do
-    profile
-    |> cast(attrs, [:display_name, :bio])
-    |> validate_required([:display_name])
-  end
-end
-```
-
-## API Usage
-
-Once set up, you get automatic REST endpoints:
-
-### List rows
-```bash
-GET /api/profiles
-GET /api/profiles?select=id,display_name
-GET /api/profiles?order=display_name.asc,inserted_at.desc
-GET /api/profiles?limit=10&offset=20
-```
-
-### Get single row
-```bash
-GET /api/profiles/123
-```
-
-### Update row
-```bash
-PATCH /api/profiles/123
-Content-Type: application/json
-
-{"display_name": "New Name", "bio": "Updated bio"}
-```
-
-## Security Model
-
-Sieve enforces row-level security automatically:
-
-1. **Ownership scoping** - All queries filter by `owner_key == current_user.id`
-2. **Read protection** - Only fields in `readable` list can be returned
-3. **Write protection** - Only fields in `writable` list can be updated
-4. **Implicit 404s** - Attempting to access another user's row returns not found
-
-## Table Specification
-
-Each table requires these fields:
-
-- **schema** - The Ecto schema module
-- **pk** - Primary key field (usually `:id`)
-- **owner_key** - Field that identifies row ownership (e.g., `:user_id`)
-- **readable** - List of fields that can be read via the API
-- **writable** - List of fields that can be updated via the API
-
-## Query Parameters
-
-### `select` - Field projection
-```
-GET /api/profiles?select=id,display_name,bio
-```
-Returns only the specified fields (must be in `readable` list).
-
-### `order` - Sorting
-```
-GET /api/profiles?order=display_name.asc
-GET /api/profiles?order=display_name.desc,inserted_at.asc
-```
-Sort by one or more fields. Direction is `asc` (default) or `desc`.
-
-### `limit` and `offset` - Pagination
-```
-GET /api/profiles?limit=10&offset=20
-```
-Default limit is 50, maximum is 200.
-
-### `filter` - Field filtering
-```
-GET /api/profiles?filter[status]=active
-GET /api/profiles?filter[name]=ilike:john%
-GET /api/profiles?filter[age]=gt:18
-GET /api/profiles?filter[role]=in:admin,moderator
-```
-
-Filter records by field values. Supports operators:
-
-| Operator | Example | SQL Equivalent |
-|----------|---------|----------------|
-| (none) | `filter[status]=active` | `WHERE status = 'active'` |
-| `like:` | `filter[name]=like:John%` | `WHERE name LIKE 'John%'` |
-| `ilike:` | `filter[name]=ilike:john%` | `WHERE name ILIKE 'john%'` (case-insensitive) |
-| `gt:` | `filter[age]=gt:18` | `WHERE age > 18` |
-| `gte:` | `filter[age]=gte:18` | `WHERE age >= 18` |
-| `lt:` | `filter[age]=lt:65` | `WHERE age < 65` |
-| `lte:` | `filter[age]=lte:65` | `WHERE age <= 65` |
-| `ne:` | `filter[status]=ne:deleted` | `WHERE status != 'deleted'` |
-| `in:` | `filter[role]=in:a,b,c` | `WHERE role IN ('a', 'b', 'c')` |
-| `is_nil:` | `filter[deleted_at]=is_nil:true` | `WHERE deleted_at IS NULL` |
-| `is_nil:` | `filter[deleted_at]=is_nil:false` | `WHERE deleted_at IS NOT NULL` |
-
-Multiple filters are combined with AND:
-```
-GET /api/profiles?filter[status]=active&filter[role]=admin
-# WHERE status = 'active' AND role = 'admin'
-```
-
-**Security**: Only fields that exist on the schema can be filtered. Optionally, you can restrict filterable fields by adding a `filterable` list to your resource spec:
-
-```elixir
-resource "profiles", %{
-  schema: MyApp.Profile,
-  policy: MyPolicy,
-  filterable: [:status, :role, :name]  # Only these fields can be filtered
+resource "posts", %{
+  schema: MyApp.Blog.Post,
+  policy: MyApp.Policies.OwnedByUser,
+  on_create: [
+    %Sieve.JobSpec{worker: MyApp.Workers.IndexPost}
+  ],
+  on_update: [
+    %Sieve.JobSpec{
+      worker: MyApp.Workers.NotifySubscribers,
+      # Only run when status changes to published
+      args: fn before, after_record ->
+        if before.status != :published and after_record.status == :published do
+          %{post_id: after_record.id}
+        end
+      end
+    }
+  ],
+  on_delete: [
+    %Sieve.JobSpec{worker: MyApp.Workers.CleanupPost}
+  ]
 }
 ```
 
-## Advanced Usage
+## OpenAPI spec
 
-### Custom actor resolution
-
-By default, the actor is `conn.assigns.current_user`. You can customize this:
+Generate OpenAPI 3.0 docs from your resource definitions:
 
 ```elixir
-use Sieve.Controller,
-  registry: MyApp.TableRegistry,
-  repo: MyApp.Repo,
-  actor_key: :current_account  # Use conn.assigns.current_account instead
-```
+defmodule MyAppWeb.ApiSpec do
+  alias OpenApiSpex.{Info, OpenApi, Server}
 
-### Override controller actions
-
-All controller actions are overridable:
-
-```elixir
-defmodule MyAppWeb.TableController do
-  use MyAppWeb, :controller
-  use Sieve.Controller, registry: MyApp.TableRegistry, repo: MyApp.Repo
-
-  # Add custom logging
-  def index(conn, params) do
-    Logger.info("Table list request: #{inspect(params)}")
-    super(conn, params)
+  def spec do
+    %OpenApi{
+      info: %Info{title: "My API", version: "1.0"},
+      servers: [%Server{url: "https://api.example.com"}],
+      paths: MyApp.Resources.open_api_fragment().paths,
+      components: %{schemas: MyApp.Resources.open_api_fragment().schemas}
+    }
   end
 end
 ```
 
-## Architecture
+## Installation
 
-The library is structured in layers:
-
-```
-Sieve.Controller     # Phoenix controller (integrates with your app)
-       ↓
-Sieve.Registry      # Table lookup
-       ↓
-Sieve.Gateway       # Query building & execution
-       ↓
-Ecto.Repo          # Database access
+```elixir
+def deps do
+  [{:sieve, "~> 0.1.0"}]
+end
 ```
 
-- **Controller** - Phoenix integration, receives HTTP requests
-- **Registry** - Maps table names to specifications
-- **Gateway** - Builds secure Ecto queries with filtering, ordering, pagination
-- **TableSpec** - Behaviour defining table structure and permissions
+## Why
 
-## Examples
+Writing CRUD controllers is tedious. You end up with the same patterns over and over: authorize, validate, query, respond. Sieve consolidates this into a declarative config.
 
-See the `examples/` directory for:
-- `inline_registry.ex` - Simple inline table definitions
-- `module_registry.ex` - Module-based registry with separate table files
-- `controller.ex` - Phoenix controller setup
-
-## Roadmap
-
-Potential future features:
-- [ ] POST support for creating rows
-- [ ] DELETE support
-- [x] Filtering via URL params (e.g., `?filter[title]=like:hello%`)
-- [ ] Relationship embedding/expansion
-- [ ] RPC-style function calls
-- [ ] Bulk operations
-
-## Credits
-
-Inspired by PostgREST.
-
+The constraint is intentional. You give up some flexibility in exchange for consistency and less code. If you need custom logic, write a regular controller for that endpoint.
